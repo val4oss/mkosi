@@ -67,6 +67,32 @@ class Installer(DistributionInstaller, distribution=Distribution.opensuse):
 
     @classmethod
     def repositories(cls, context: Context) -> Iterable[RpmRepository]:
+        # Import custom GPG keys if provided (needs to happen before any repository operations)
+        from mkosi.log import log_step
+        image_name = context.config.image_id or context.config.output or 'main'
+        log_step(f"Setting up repositories for image: {image_name}")
+        log_step(f"  → Output: {context.config.output}")
+        log_step(f"  → Image ID: {context.config.image_id}")
+        log_step(f"  → GpgKeys count: {len(context.config.gpgkeys)}")
+        if context.config.gpgkeys:
+            log_step(f"Importing {len(context.config.gpgkeys)} custom GPG key(s)...")
+            for key in context.config.gpgkeys:
+                log_step(f"  → {key}")
+            run(
+                [
+                    "rpm",
+                    "--root=/buildroot",
+                    "--import",
+                    *context.config.gpgkeys,
+                ],
+                sandbox=context.sandbox(
+                    options=[
+                        *context.rootoptions(),
+                        *finalize_certificate_mounts(context.config),
+                    ],
+                ),
+            )  # fmt: skip
+
         if context.config.local_mirror:
             yield RpmRepository(id="local-mirror", url=f"baseurl={context.config.local_mirror}", gpgurls=())
             return

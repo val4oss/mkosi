@@ -35,7 +35,7 @@ from mkosi.distribution import Distribution, detect_distribution
 from mkosi.log import ARG_DEBUG, ARG_DEBUG_SANDBOX, ARG_DEBUG_SHELL, complete_step, die
 from mkosi.pager import page
 from mkosi.run import SandboxProtocol, find_binary, nosandbox, run, sandbox_cmd, workdir
-from mkosi.sandbox import ANSI_BLUE, ANSI_BOLD, ANSI_RESET, __version__
+from mkosi.sandbox import Style, __version__
 from mkosi.user import INVOKING_USER
 from mkosi.util import (
     PathString,
@@ -633,7 +633,6 @@ class ArtifactOutput(StrEnum):
     roothash = enum.auto()
     os_release = enum.auto()
     kernel_modules_initrd = enum.auto()
-    repart_definitions = enum.auto()
 
     @staticmethod
     def compat_no() -> list["ArtifactOutput"]:
@@ -1006,12 +1005,12 @@ def config_default_output(namespace: dict[str, Any]) -> str:
 
 
 def config_default_distribution(namespace: dict[str, Any]) -> Distribution:
-    if (d := os.getenv("MKOSI_HOST_DISTRIBUTION")) and d in Distribution.values():
+    if d := os.getenv("MKOSI_HOST_DISTRIBUTION"):
         return Distribution(d)
 
     detected = detect_distribution()[0]
 
-    if not isinstance(detected, Distribution):
+    if not detected:
         logging.info(
             "Distribution of your host can't be detected or isn't a supported target. "
             "Defaulting to Distribution=custom."
@@ -1022,14 +1021,10 @@ def config_default_distribution(namespace: dict[str, Any]) -> Distribution:
 
 
 def config_default_release(namespace: dict[str, Any]) -> str:
-    hd: Union[Distribution, str, None]
+    hd: Optional[Distribution]
     hr: Optional[str]
 
-    if (
-        (d := os.getenv("MKOSI_HOST_DISTRIBUTION"))
-        and d in Distribution.values()
-        and (r := os.getenv("MKOSI_HOST_RELEASE"))
-    ):
+    if (d := os.getenv("MKOSI_HOST_DISTRIBUTION")) and (r := os.getenv("MKOSI_HOST_RELEASE")):
         hd, hr = Distribution(d), r
     else:
         hd, hr = detect_distribution()
@@ -1042,12 +1037,12 @@ def config_default_release(namespace: dict[str, Any]) -> str:
 
 
 def config_default_tools_tree_distribution(namespace: dict[str, Any]) -> Distribution:
-    if (d := os.getenv("MKOSI_HOST_DISTRIBUTION")) and d in Distribution.values():
+    if d := os.getenv("MKOSI_HOST_DISTRIBUTION"):
         return Distribution(d).installer.default_tools_tree_distribution() or Distribution(d)
 
     detected = detect_distribution()[0]
 
-    if not isinstance(detected, Distribution):
+    if not detected:
         return Distribution.custom
 
     return detected.installer.default_tools_tree_distribution() or detected
@@ -1058,11 +1053,10 @@ def config_default_repository_key_fetch(namespace: dict[str, Any]) -> bool:
         return distribution == Distribution.arch or distribution.is_rpm_distribution()
 
     if namespace["tools_tree"] not in (Path("default"), Path("yes")):
-        d = detect_distribution(namespace["tools_tree"] or Path("/"))[0]
-        if d == "nixos":
-            return True
-
-        return d == Distribution.ubuntu and needs_repository_key_fetch(namespace["distribution"])
+        return (
+            detect_distribution(namespace["tools_tree"] or Path("/"))[0] == Distribution.ubuntu
+            and needs_repository_key_fetch(namespace["distribution"])
+        )  # fmt: skip
 
     return namespace["tools_tree_distribution"] == Distribution.ubuntu and needs_repository_key_fetch(
         namespace["distribution"]
@@ -1676,8 +1670,6 @@ class SettingScope(StrEnum):
     tools = enum.auto()
     # Only passed down to initrd, can only be configured in main image.
     initrd = enum.auto()
-    # Like inherit, but only inherited by the default initrd.
-    initrd_inherit = enum.auto()
 
     def is_main_setting(self) -> bool:
         return self in (SettingScope.main, SettingScope.tools, SettingScope.initrd, SettingScope.multiversal)
@@ -1993,6 +1985,7 @@ class Config:
     repository_key_check: bool
     repository_key_fetch: bool
     repositories: list[str]
+    gpgkeys: list[Path]
 
     output_format: OutputFormat
     manifest_format: list[ManifestFormat]
@@ -2306,10 +2299,6 @@ class Config:
         return f"{self.output}.kernel-modules-initrd"
 
     @property
-    def output_split_repart_definitions(self) -> str:
-        return f"{self.output}.repart.d"
-
-    @property
     def output_nspawn_settings(self) -> str:
         return f"{self.output}.nspawn"
 
@@ -2351,7 +2340,6 @@ class Config:
             self.output_split_roothash,
             self.output_split_os_release,
             self.output_split_kernel_modules_initrd,
-            self.output_split_repart_definitions,
             self.output_nspawn_settings,
             self.output_checksum,
             self.output_signature,
@@ -2389,6 +2377,7 @@ class Config:
             ),
             "packages": sorted(self.packages),
             "build_packages": sorted(self.build_packages),
+            "remove_packages": sorted(self.remove_packages),
             "package_directories": [
                 (p.name, p.stat().st_mtime_ns)
                 for d in self.package_directories
@@ -2496,6 +2485,7 @@ class Config:
         scripts: Optional[Path] = None,
         overlay: Optional[Path] = None,
         options: Sequence[PathString] = (),
+        setup: Sequence[PathString] = (),
     ) -> AbstractContextManager[list[PathString]]:
         opt: list[PathString] = [*options]
 
@@ -2517,6 +2507,7 @@ class Config:
             tools=self.tools() if tools else Path("/"),
             overlay=overlay,
             options=opt,
+            setup=setup,
             extra=self.extra_search_paths,
         )
 
@@ -2758,6 +2749,18 @@ SETTINGS: list[ConfigSetting[Any]] = [
         parse=config_make_list_parser(delimiter=","),
         match=config_make_list_matcher(parse=str),
         help="Repositories to use",
+        scope=SettingScope.universal,
+        tools=True,
+    ),
+    ConfigSetting(
+        dest="gpgkeys",
+        name="GpgKeys",
+        metavar="PATHS",
+        section="Distribution",
+        parse=config_make_list_parser(delimiter=",", parse=make_path_parser()),
+        match=config_make_list_matcher(parse=make_path_parser()),
+        path_suffixes=("gpg",),
+        help="GPG keys to enroll in the RPM database",
         scope=SettingScope.universal,
         tools=True,
     ),
@@ -3368,7 +3371,6 @@ SETTINGS: list[ConfigSetting[Any]] = [
         section="Content",
         parse=config_parse_string,
         help="Set the system keymap",
-        scope=SettingScope.initrd_inherit,
     ),
     ConfigSetting(
         dest="timezone",
@@ -3376,7 +3378,6 @@ SETTINGS: list[ConfigSetting[Any]] = [
         section="Content",
         parse=config_parse_string,
         help="Set the system timezone",
-        scope=SettingScope.initrd_inherit,
     ),
     ConfigSetting(
         dest="hostname",
@@ -3384,7 +3385,6 @@ SETTINGS: list[ConfigSetting[Any]] = [
         section="Content",
         parse=config_parse_string,
         help="Set the system hostname",
-        scope=SettingScope.initrd_inherit,
     ),
     ConfigSetting(
         dest="root_password",
@@ -3395,7 +3395,6 @@ SETTINGS: list[ConfigSetting[Any]] = [
         path_read_text=True,
         path_secret=True,
         help="Set the password for root",
-        scope=SettingScope.initrd_inherit,
     ),
     ConfigSetting(
         dest="root_shell",
@@ -4383,7 +4382,7 @@ def create_argument_parser(chdir: bool = True) -> argparse.ArgumentParser:
                 mkosi [options…] {b}journalctl{e}    [-- command line…]
                 mkosi [options…] {b}coredumpctl{e}   [-- command line…]
                 mkosi [options…] {b}sysupdate{e}     [-- command line…]
-                mkosi [options…] {b}box{e}           [-- command line…]
+                mkosi [options…] {b}sandbox{e}       [-- command line…]
                 mkosi [options…] {b}dependencies{e}  [-- options…]
                 mkosi [options…] {b}clean{e}
                 mkosi [options…] {b}serve{e}
@@ -4395,7 +4394,7 @@ def create_argument_parser(chdir: bool = True) -> argparse.ArgumentParser:
                 mkosi [options…] {b}help{e}
                 mkosi -h | --help
                 mkosi --version
-        """).format(b=ANSI_BOLD, e=ANSI_RESET),
+        """).format(b=Style.bold, e=Style.reset),
         add_help=False,
         allow_abbrev=False,
         argument_default=argparse.SUPPRESS,
@@ -5058,7 +5057,7 @@ def have_history(args: Args) -> bool:
     if args.directory is None:
         return False
 
-    if args.verb in (Verb.clean, Verb.box, Verb.sandbox, Verb.latest_snapshot):
+    if args.verb in (Verb.clean, Verb.sandbox, Verb.latest_snapshot):
         return False
 
     if args.verb == Verb.summary and args.force > 0:
@@ -5138,7 +5137,7 @@ def finalize_default_initrd(
     for s in SETTINGS:
         if s.scope in (SettingScope.universal, SettingScope.multiversal):
             context.cli[s.dest] = copy.deepcopy(finalized[s.dest])
-        elif s.scope in (SettingScope.inherit, SettingScope.initrd_inherit) and s.dest in finalized:
+        elif s.scope == SettingScope.inherit and s.dest in finalized:
             context.config[s.dest] = copy.deepcopy(finalized[s.dest])
         elif s.scope == SettingScope.initrd:
             # If the setting was specified on the CLI for the main config, we treat it as specified on the
@@ -5482,7 +5481,7 @@ def finalize_git_config(proxy_url: Optional[str], env: dict[str, str]) -> dict[s
     try:
         cnt = int(env.get("GIT_CONFIG_COUNT", "0"))
     except ValueError:
-        raise ValueError("GIT_CONFIG_COUNT environment variable must be set to a valid integer") from None
+        raise ValueError("GIT_CONFIG_COUNT environment variable must be set to a valid integer")
 
     # Override HTTP/HTTPS proxy in case its set in .gitconfig to a different value than proxy_url.
     # No need to override http.proxy / https.proxy if set in a previous GIT_CONFIG_* variable since
@@ -5544,7 +5543,7 @@ def format_octal_or_default(oct_value: Optional[int]) -> str:
 
 
 def bold(s: Any) -> str:
-    return f"{ANSI_BOLD}{s}{ANSI_RESET}"
+    return f"{Style.bold}{s}{Style.reset}"
 
 
 def cat_config(images: Sequence[Config]) -> str:
@@ -5559,7 +5558,7 @@ def cat_config(images: Sequence[Config]) -> str:
             # Display the paths as relative to ., if underneath.
             if path.is_relative_to(Path.cwd()):
                 path = path.relative_to(Path.cwd())
-            print(f"{ANSI_BLUE}# {path}{ANSI_RESET}", file=c)
+            print(f"{Style.blue}# {path}{Style.reset}", file=c)
             print(path.read_text(), file=c)
 
     return c.getvalue()
@@ -6052,21 +6051,6 @@ def want_selinux_relabel(
     binpolicy = sorted(policies, key=lambda p: GenericVersion(p.name), reverse=True)[0]
 
     return setfiles, policy, fc, binpolicy
-
-
-def swtpm_setup_version(sandbox: SandboxProtocol = nosandbox) -> GenericVersion:
-    version = GenericVersion(
-        run(
-            ["swtpm_setup", "--version"],
-            stdout=subprocess.PIPE,
-            sandbox=sandbox(),
-            success_exit_status=(0, 1),
-        ).stdout.split()[-1]
-    )
-
-    logging.debug(f"Version reported by swtpm_setup is {version}")
-
-    return version
 
 
 def systemd_tool_version(*tool: PathString, sandbox: SandboxProtocol = nosandbox) -> GenericVersion:
